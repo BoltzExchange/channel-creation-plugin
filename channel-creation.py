@@ -40,6 +40,13 @@ class ChannelCreation:
 PLUGIN = Plugin()
 
 
+def print_error(message: str):
+    print(message)
+    return {
+        "error": message[0].lower() + message[1:],
+    }
+
+
 def get_keys():
     private_key = bytes.fromhex(binascii.hexlify(urandom(32)).decode())
 
@@ -174,6 +181,14 @@ def add_channel_creation(plugin: Plugin, invoice_amount: int, inbound_percentage
             "error": "there is a pending channel creation already",
         }
 
+    peers = plugin.rpc.listpeers()["peers"]
+
+    for peer in peers:
+        if peer["id"] == plugin.boltz_node and len(peer["channels"]) != 0:
+            return {
+                "error": "there is a channel with Boltz node already"
+            }
+
     try:
         invoice_label = "boltz-channel-{}".format(random.randint(0, 100000))
         invoice_response = plugin.rpc.invoice(
@@ -190,6 +205,9 @@ def add_channel_creation(plugin: Plugin, invoice_amount: int, inbound_percentage
             private,
             inbound_percentage,
         )
+
+        if hasattr(swap, "error"):
+            return print_error("Could not setup channel creation: {}".format(str(swap["error"])))
 
         print("Created swap: {}".format(swap))
 
@@ -215,12 +233,7 @@ def add_channel_creation(plugin: Plugin, invoice_amount: int, inbound_percentage
             "bip21": swap["bip21"],
         }
     except requests.ConnectionError or requests.HTTPError as error:
-        message = "Could not add channel creation: {}".format(str(error))
-
-        print(message)
-        return {
-            "error": message[0].lower() + message[1:],
-        }
+        return print_error("Could not add channel creation: {}".format(str(error)))
 
 
 @PLUGIN.method("getchannelcreation")
