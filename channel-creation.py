@@ -186,7 +186,7 @@ def add_channel_creation(plugin: Plugin, invoice_amount: int, inbound_percentage
     for peer in peers:
         if peer["id"] == plugin.boltz_node and len(peer["channels"]) != 0:
             return {
-                "error": "there is a channel with Boltz node already"
+                "error": "there is a channel with the Boltz node already"
             }
 
     try:
