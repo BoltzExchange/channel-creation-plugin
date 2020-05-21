@@ -21,6 +21,7 @@ class Status(Enum):
 @dataclass
 class ChannelCreation:
     status: Status
+    id: str
 
     private_key: str
     redeem_script: str
@@ -79,6 +80,7 @@ def create_swap(boltz_api: str, invoice: str, refund_key: str, private: bool, in
 def format_channel_creation(channel_creation: ChannelCreation):
     return {
         "status": channel_creation.status.name,
+        "id": channel_creation.id,
         "private_key": channel_creation.private_key,
         "redeem_script": channel_creation.redeem_script,
         "private": channel_creation.private,
@@ -108,6 +110,7 @@ def read_channel_creation(plugin: Plugin):
             raw_data = json.load(file)
             plugin.channel_creation = ChannelCreation(
                 status=Status[raw_data["status"]],
+                id=raw_data["id"],
                 private_key=raw_data["private_key"],
                 redeem_script=raw_data["redeem_script"],
                 private=raw_data["private"],
@@ -185,9 +188,13 @@ def add_channel_creation(plugin: Plugin, invoice_amount: int, inbound_percentage
 
     for peer in peers:
         if peer["id"] == plugin.boltz_node and len(peer["channels"]) != 0:
-            return {
-                "error": "there is a channel with the Boltz node already"
-            }
+            channels = peer["channels"]
+
+            for channel in channels:
+                if channel["state"] != "ONCHAIN":
+                    return {
+                        "error": "there is a channel with the Boltz node already"
+                    }
 
     try:
         invoice_label = "boltz-channel-{}".format(random.randint(0, 100000))
@@ -212,6 +219,7 @@ def add_channel_creation(plugin: Plugin, invoice_amount: int, inbound_percentage
         print("Created swap: {}".format(swap))
 
         plugin.channel_creation = ChannelCreation(
+            id=swap["id"],
             private=private,
             bip21=swap["bip21"],
             status=Status.Created,
