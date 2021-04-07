@@ -125,7 +125,7 @@ def read_channel_creation(plugin: Plugin):
             print("Read exiting channel creation state: {}".format(format_channel_creation(plugin.channel_creation)))
 
     except FileNotFoundError:
-        print("Did not file existing channel creation state")
+        print("Did not find existing channel creation state")
 
 
 def check_channel_open(openchannel, plugin: Plugin) -> str:
@@ -213,7 +213,7 @@ def add_channel_creation(plugin: Plugin, invoice_amount: int, inbound_percentage
             inbound_percentage,
         )
 
-        if hasattr(swap, "error"):
+        if "error" in swap:
             return print_error("Could not setup channel creation: {}".format(str(swap["error"])))
 
         print("Created swap: {}".format(swap))
