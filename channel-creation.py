@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+
 import math
 import json
 import ecdsa
@@ -74,6 +75,11 @@ def create_swap(boltz_api: str, invoice: str, refund_key: str, private: bool, in
         },
     )
 
+    return request.json()
+
+
+def get_nodes(boltz_api: str):
+    request = requests.get("{}/getnodes".format(boltz_api))
     return request.json()
 
 
@@ -162,6 +168,27 @@ def init(plugin: Plugin, options: Mapping[str, str], **_kwargs):
 
     print("Channel Creation data location: {}".format(plugin.data_location))
     read_channel_creation(plugin)
+
+    if plugin.boltz_api == "":
+        info = plugin.rpc.getinfo()
+        network = info["network"]
+
+        if network == "mainnet":
+            plugin.boltz_api = "https://boltz.exchange/api"
+        elif network == "testnet":
+            plugin.boltz_api = "https://testnet.boltz.exchange/api"
+        elif network == "regtest":
+            plugin.boltz_api = "http://127.0.0.1:9001"
+        else:
+            raise ValueError("No default API for network {} available".format(network))
+
+        print("Using default Boltz API for network {}: {}".format(network, plugin.boltz_api))
+
+    if plugin.boltz_node == "":
+        nodes = get_nodes(plugin.boltz_api)
+        plugin.boltz_node = nodes["nodes"]["BTC"]["nodeKey"]
+
+        print("Fetched Boltz lightning node public key: {}".format(plugin.boltz_node))
 
     print("Started channel-creation plugin: {}".format({
         "boltz_api": plugin.boltz_api,
@@ -325,8 +352,6 @@ def on_invoice_payment(payment, plugin: Plugin, request, **_kwargs):
 
 
 # TODO: automatically connect to node
-# TODO: get node from API
-# TODO: default values
 PLUGIN.add_option(
     "boltz-api",
     "",
