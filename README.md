@@ -4,13 +4,7 @@ This is a c-lightning plugin for Boltz Channel Creation Swaps
 
 ## Installation
 
-This plugin is written in Python an works with Python version `3.7` or higher. Its dependencies can be installed with:
-
-```bash
-pip3 install pyln-client ecdsa requests
-```
-
-Or:
+This plugin is written in Python and works with Python version `3.7` or higher. Its dependencies can be installed with:
 
 ```bash
 pip3 install -r requirements.txt

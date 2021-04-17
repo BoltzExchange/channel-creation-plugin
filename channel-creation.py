@@ -1,15 +1,24 @@
 #!/usr/bin/env python3
 
-import math
+# TODO: consistent error handling
+
 import json
-import ecdsa
+import math
 import random
-import binascii
-import requests
-from enum import Enum
-from typing import Mapping
-from os import path, urandom
 from dataclasses import dataclass
+from enum import Enum
+from hashlib import sha256
+from os import path, urandom
+from typing import Mapping
+
+import requests
+from bitcoin import SelectParams
+from bitcoin.core import CTransaction, CMutableTransaction, CMutableTxIn, CMutableTxOut, COutPoint, CTxWitness, \
+    CTxInWitness, CScriptWitness
+from bitcoin.core import x, b2x
+from bitcoin.core.script import OP_0, OP_HASH160, OP_EQUAL, CScript, Hash160, SignatureHash, SIGHASH_ALL, \
+    SIGVERSION_WITNESS_V0
+from bitcoin.wallet import CBitcoinAddress, CBitcoinAddressError, CBitcoinSecret
 from pyln.client import Plugin, Millisatoshi
 
 
@@ -17,6 +26,7 @@ class Status(Enum):
     Created = "created"
     ChannelAccepted = "channel_accepted"
     InvoicePaid = "invoice_paid"
+    Refunded = "refunded"
 
 
 @dataclass
@@ -42,6 +52,42 @@ class ChannelCreation:
 PLUGIN = Plugin()
 
 
+class BoltzApi:
+    def __init__(self, api: str):
+        self.api = api
+
+    def get_nodes(self):
+        request = requests.get("{}/getnodes".format(self.api))
+        return request.json()
+
+    def get_swap_transaction(self, swap_id: str):
+        request = requests.post(
+            "{}/getswaptransaction".format(self.api),
+            json={
+                "id": swap_id,
+            },
+        )
+        return request.json()
+
+    def create_swap(self, invoice: str, refund_key: str, private: bool, inbound: int):
+        request = requests.post(
+            "{}/createswap".format(self.api),
+            json={
+                "type": "submarine",
+                "pairId": "BTC/BTC",
+                "orderSide": "buy",
+                "invoice": invoice,
+                "refundPublicKey": refund_key,
+                "channel": {
+                    "auto": False,
+                    "private": private,
+                    "inboundLiquidity": inbound,
+                },
+            },
+        )
+        return request.json()
+
+
 def print_error(message: str):
     print(message)
     return {
@@ -50,37 +96,10 @@ def print_error(message: str):
 
 
 def get_keys():
-    private_key = bytes.fromhex(binascii.hexlify(urandom(32)).decode())
+    entropy = urandom(32)
+    private_key = CBitcoinSecret.from_secret_bytes(entropy)
 
-    signing_key = ecdsa.SigningKey.from_string(private_key, curve=ecdsa.SECP256k1)
-    public_key = signing_key.get_verifying_key()
-
-    return signing_key.to_string().hex(), public_key.to_string().hex()
-
-
-def create_swap(boltz_api: str, invoice: str, refund_key: str, private: bool, inbound: int):
-    request = requests.post(
-        "{}/createswap".format(boltz_api),
-        json={
-            "type": "submarine",
-            "pairId": "BTC/BTC",
-            "orderSide": "buy",
-            "invoice": invoice,
-            "refundPublicKey": refund_key,
-            "channel": {
-                "auto": False,
-                "private": private,
-                "inboundLiquidity": inbound,
-            },
-        },
-    )
-
-    return request.json()
-
-
-def get_nodes(boltz_api: str):
-    request = requests.get("{}/getnodes".format(boltz_api))
-    return request.json()
+    return entropy.hex(), private_key.pub.hex()
 
 
 def format_channel_creation(channel_creation: ChannelCreation):
@@ -159,39 +178,99 @@ def check_channel_open(openchannel, plugin: Plugin) -> str:
     return ""
 
 
+def find_swap_output(lockup_transaction: CTransaction, redeem_script: str) -> int:
+    redeem_hash = sha256(x(redeem_script)).digest()
+
+    pw2sh_script = CScript([OP_0, redeem_hash])
+    p2sh_script = CScript([OP_HASH160, Hash160(pw2sh_script), OP_EQUAL]).hex()
+
+    for i in range(len(lockup_transaction.vout)):
+        if lockup_transaction.vout[i].scriptPubKey.hex() == p2sh_script:
+            return i
+
+    raise ValueError("could not find swap output")
+
+
+def construct_refund_transaction(
+        channel_creation: ChannelCreation,
+        lockup_transaction: CTransaction,
+        address: str,
+        timeout_block_height: int,
+) -> CMutableTransaction:
+    redeem_script = CScript.fromhex(channel_creation.redeem_script)
+    lockup_vout = find_swap_output(lockup_transaction, channel_creation.redeem_script)
+
+    nested_script = b'\x22\x00\x20' + sha256(redeem_script).digest()
+    inputs = [CMutableTxIn(COutPoint(lockup_transaction.GetTxid(), lockup_vout), nested_script, 0xfffffffd)]
+
+    try:
+        output_script = CBitcoinAddress(address).to_scriptPubKey()
+    except CBitcoinAddressError:
+        raise ValueError("Could not parse Bitcoin address: {}".format(address))
+
+    input_amount = lockup_transaction.vout[lockup_vout].nValue
+
+    # TODO: configurable transaction fee + reasonable default
+    output_amount = input_amount - 1000
+
+    outputs = [CMutableTxOut(output_amount, output_script)]
+
+    refund_transaction = CMutableTransaction(inputs, outputs, timeout_block_height)
+
+    sighash = SignatureHash(
+        inIdx=0,
+        amount=input_amount,
+        hashtype=SIGHASH_ALL,
+        script=redeem_script,
+        txTo=refund_transaction,
+        sigversion=SIGVERSION_WITNESS_V0,
+    )
+
+    key = CBitcoinSecret.from_secret_bytes(bytes.fromhex(channel_creation.private_key))
+    sig = key.sign(sighash) + bytes([SIGHASH_ALL])
+
+    refund_transaction.wit = CTxWitness([CTxInWitness(CScriptWitness([sig, bytes(), redeem_script]))])
+
+    return refund_transaction
+
+
 @PLUGIN.init()
 def init(plugin: Plugin, options: Mapping[str, str], **_kwargs):
-    plugin.boltz_api = options["boltz-api"]
-    plugin.boltz_node = options["boltz-node"]
-
     plugin.data_location = path.join(plugin.rpc.listconfigs()["lightning-dir"], "channel-creation.json")
 
     print("Channel Creation data location: {}".format(plugin.data_location))
     read_channel_creation(plugin)
 
-    if plugin.boltz_api == "":
-        info = plugin.rpc.getinfo()
-        network = info["network"]
+    info = plugin.rpc.getinfo()
+    network = info["network"]
 
+    SelectParams(network)
+
+    if options["boltz-api"] == "":
         if network == "mainnet":
-            plugin.boltz_api = "https://boltz.exchange/api"
+            api_url = "https://boltz.exchange/api"
         elif network == "testnet":
-            plugin.boltz_api = "https://testnet.boltz.exchange/api"
+            api_url = "https://testnet.boltz.exchange/api"
         elif network == "regtest":
-            plugin.boltz_api = "http://127.0.0.1:9001"
+            api_url = "http://127.0.0.1:9001"
         else:
             raise ValueError("No default API for network {} available".format(network))
 
-        print("Using default Boltz API for network {}: {}".format(network, plugin.boltz_api))
+        plugin.boltz_api = BoltzApi(api_url)
+        print("Using default Boltz API for network {}: {}".format(network, api_url))
 
+    else:
+        plugin.boltz_api = BoltzApi(options["boltz-api"])
+
+    plugin.boltz_node = options["boltz-node"]
     if plugin.boltz_node == "":
-        nodes = get_nodes(plugin.boltz_api)
+        nodes = plugin.boltz_api.get_nodes()
         plugin.boltz_node = nodes["nodes"]["BTC"]["nodeKey"]
 
         print("Fetched Boltz lightning node public key: {}".format(plugin.boltz_node))
 
     print("Started channel-creation plugin: {}".format({
-        "boltz_api": plugin.boltz_api,
+        "boltz_api": plugin.boltz_api.api,
         "boltz_node": plugin.boltz_node,
     }))
 
@@ -206,7 +285,8 @@ def add_channel_creation(plugin: Plugin, invoice_amount: int, inbound_percentage
     """Adds a new Boltz Channel Creation Swap"""
     if hasattr(plugin, "channel_creation") \
             and plugin.channel_creation is not None \
-            and plugin.channel_creation.status is not Status.InvoicePaid:
+            and (plugin.channel_creation.status is not Status.InvoicePaid and
+                 plugin.channel_creation.status is not Status.Refunded):
         return {
             "error": "there is a pending channel creation already",
         }
@@ -232,8 +312,7 @@ def add_channel_creation(plugin: Plugin, invoice_amount: int, inbound_percentage
         )
 
         private_key, public_key = get_keys()
-        swap = create_swap(
-            plugin.boltz_api,
+        swap = plugin.boltz_api.create_swap(
             invoice_response["bolt11"],
             public_key,
             private,
@@ -280,6 +359,68 @@ def get_channel_creation(plugin: Plugin):
         }
 
     return format_channel_creation(plugin.channel_creation)
+
+
+@PLUGIN.method("refundchannelcreation")
+def refund_channel_creation(plugin: Plugin, address=""):
+    """Refunds the lockup transaction of a Channel Creation Swap"""
+    if not hasattr(plugin, "channel_creation") or \
+            plugin.channel_creation is None or \
+            (plugin.channel_creation.status is Status.InvoicePaid or plugin.channel_creation.status is Status.Refunded):
+        return {
+            "error": "no refundable channel creation found"
+        }
+
+    print("Refunding channel creation {}".format(plugin.channel_creation.id))
+
+    info = plugin.rpc.getchaininfo()
+    swap_transaction = plugin.boltz_api.get_swap_transaction(plugin.channel_creation.id)
+
+    if hasattr(swap_transaction, "error"):
+        return {
+            "error": "could not find lockup transaction: {}".format(swap_transaction["error"]),
+        }
+
+    if info["blockcount"] < swap_transaction["timeoutBlockHeight"]:
+        return {
+            "error": "channel creation cannot be refunded before block height {}"
+            .format(swap_transaction["timeoutBlockHeight"])
+        }
+
+    if address == "":
+        new_addr = plugin.rpc.newaddr()["address"]
+        address = new_addr
+        print("Got address to refund to: {}".format(address))
+
+    lock_transaction = CTransaction.deserialize(x(swap_transaction["transactionHex"]))
+
+    refund_transaction = construct_refund_transaction(
+        plugin.channel_creation,
+        lock_transaction,
+        address,
+        swap_transaction["timeoutBlockHeight"],
+    )
+
+    refund_transaction_hex = b2x(refund_transaction.serialize())
+    refund_transaction_id = b2x(refund_transaction.GetTxid()[::-1])
+
+    print("Constructed refund transaction {}: {}".format(refund_transaction_id, refund_transaction_hex))
+
+    broadcast_response = plugin.rpc.sendrawtransaction(refund_transaction_hex, False)
+
+    if broadcast_response["success"]:
+        print("Broadcast refund transaction: {}".format(refund_transaction_id))
+        update_channel_creation_status(plugin, plugin.channel_creation, Status.Refunded)
+    else:
+        return {
+            "error": "could not broadcast refund transaction {}"
+            .format(broadcast_response["errmsg"])
+        }
+
+    return {
+        "txid": refund_transaction_id,
+        "txhex": refund_transaction_hex,
+    }
 
 
 #
