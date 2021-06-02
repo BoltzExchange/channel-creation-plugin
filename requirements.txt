@@ -28,5 +28,5 @@ retrying==1.3.3
 scrypt==0.8.17
 six==1.14.0
 SQLAlchemy==1.3.22
-urllib3==1.25.8
+urllib3==1.26.5
 webencodings==0.5.1
